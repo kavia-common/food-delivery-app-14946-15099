@@ -1,11 +1,23 @@
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Path, Body, Query, status
+from fastapi import FastAPI, HTTPException, Path, Body, Query, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Configuration from environment with sensible localhost defaults
+HTTP_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_TIMEOUT_SECONDS", "10"))
+
+PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://localhost:8104")
+NOTIFICATION_SERVICE_URL = os.getenv("NOTIFICATION_SERVICE_URL", "http://localhost:8106")
+LOCATION_SERVICE_URL = os.getenv("LOCATION_SERVICE_URL", "http://localhost:8107")
+PROMOTION_SERVICE_URL = os.getenv("PROMOTION_SERVICE_URL", "http://localhost:8108")
+
+# Optional internal token for service-to-service auth
+INTERNAL_SERVICE_TOKEN: Optional[str] = os.getenv("INTERNAL_SERVICE_TOKEN")
 
 # App metadata and tags for OpenAPI
 app = FastAPI(
@@ -22,7 +34,7 @@ app = FastAPI(
 # CORS for local dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[os.getenv("CORS_ALLOW_ORIGINS", "*")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -31,11 +43,16 @@ app.add_middleware(
 CART: List[Dict[str, Any]] = []
 ORDERS: Dict[str, Dict[str, Any]] = {}
 
-# Hardcoded service URLs (in real env, use env vars)
-PAYMENT_SERVICE_URL = "http://localhost:8103"  # hypothetical PaymentService
-NOTIFICATION_SERVICE_URL = "http://localhost:8104"  # hypothetical NotificationService
-LOCATION_SERVICE_URL = "http://localhost:8105"  # hypothetical LocationService
-PROMOTION_SERVICE_URL = "http://localhost:8106"  # hypothetical PromotionService
+def _service_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """
+    Build headers to call downstream services. Adds INTERNAL_SERVICE_TOKEN if present.
+    """
+    headers: Dict[str, str] = {}
+    if INTERNAL_SERVICE_TOKEN:
+        headers["X-Internal-Token"] = INTERNAL_SERVICE_TOKEN
+    if extra:
+        headers.update(extra)
+    return headers
 
 # Pydantic models aligning with openapi/order.yaml
 
@@ -118,19 +135,22 @@ def _compute_totals(items: List[CartItem], promo_code: Optional[str]) -> OrderTo
             subtotal += 10.0 * int(it.quantity)
 
     discount = 0.0
-    # Try applying promotion service
+    # Try applying promotion service (env-based URL); endpoint per PromotionService: /promotions/validate
     if promo_code:
         try:
-            with httpx.Client(timeout=2.0) as client:
+            with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
                 resp = client.post(
-                    f"{PROMOTION_SERVICE_URL}/apply",
-                    json={"promoCode": promo_code, "subtotal": subtotal},
+                    f"{PROMOTION_SERVICE_URL.rstrip('/')}/promotions/validate",
+                    json={"code": promo_code, "orderId": "temp"},
+                    headers=_service_headers(),
                 )
                 if resp.status_code == 200:
                     data = resp.json()
                     discount = float(data.get("discount", 0.0))
-        except Exception:
+        except httpx.TimeoutException:
             # ignore promo failures in MVP
+            pass
+        except httpx.HTTPError:
             pass
 
     delivery_fee = 3.99
@@ -148,41 +168,66 @@ def _compute_totals(items: List[CartItem], promo_code: Optional[str]) -> OrderTo
 
 
 def _send_notification(user_id: str, message: str, kind: str = "order_event") -> None:
+    """
+    Notify NotificationService. Uses /notifications with NotificationCreateRequest shape.
+    """
     try:
-        with httpx.Client(timeout=2.0) as client:
+        with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
             client.post(
-                f"{NOTIFICATION_SERVICE_URL}/notifications",
-                json={"userId": user_id, "message": message, "type": kind},
+                f"{NOTIFICATION_SERVICE_URL.rstrip('/')}/notifications",
+                json={
+                    "userId": user_id,
+                    "type": "order_update",
+                    "title": kind,
+                    "body": message,
+                    "data": {"message": message, "kind": kind},
+                    "channels": ["in_app"],
+                },
+                headers=_service_headers(),
             )
-    except Exception:
+    except httpx.HTTPError:
         # Swallow errors for MVP
         pass
 
 
 def _create_payment_intent(amount: float, currency: str, user_id: str) -> Optional[str]:
+    """
+    Create a payment intent via PaymentService /payments/intent.
+    """
     try:
-        with httpx.Client(timeout=3.0) as client:
+        with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
             resp = client.post(
-                f"{PAYMENT_SERVICE_URL}/payments/intents",
-                json={"amount": amount, "currency": currency, "userId": user_id},
+                f"{PAYMENT_SERVICE_URL.rstrip('/')}/payments/intent",
+                json={"amount": amount, "currency": currency, "orderId": f"tmp_{uuid.uuid4().hex}", "method": "card"},
+                headers=_service_headers(),
             )
-            if resp.status_code == 201:
+            if resp.status_code in (200, 201):
                 data = resp.json()
-                return str(data.get("paymentId") or data.get("id"))
-    except Exception:
+                return str(data.get("id") or data.get("paymentId"))
+    except httpx.HTTPError:
         pass
     return None
 
 
 def _init_order_tracking(order_id: str) -> None:
-    # Inform LocationService to create a tracking context for an order
+    """
+    Inform LocationService with a placeholder update so tracking endpoint has context.
+    For MVP, we do nothing if service is unavailable.
+    """
     try:
-        with httpx.Client(timeout=2.0) as client:
+        with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            # LocationService MVP uses /location/updates and /location/track/{orderId}
             client.post(
-                f"{LOCATION_SERVICE_URL}/orders/{order_id}/track",
-                json={"status": "created"},
+                f"{LOCATION_SERVICE_URL.rstrip('/')}/location/updates",
+                json={
+                    "orderId": order_id,
+                    "courierId": "tbd",
+                    "position": {"lat": 0.0, "lng": 0.0},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                headers=_service_headers(),
             )
-    except Exception:
+    except httpx.HTTPError:
         pass
 
 
@@ -258,7 +303,7 @@ def remove_cart_item(itemId: str = Path(..., description="Cart item ID")) -> Non
     summary="Create order from current cart",
     response_model=Order,
 )
-def create_order(req: OrderCreateRequest) -> Order:
+def create_order(req: OrderCreateRequest, request: Request) -> Order:
     """
     Create an order from provided items, compute totals, initiate payment intent,
     send a notification, and initialize order tracking.
